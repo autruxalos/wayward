@@ -1,9 +1,26 @@
 ; =============================================================================
-; XKERNEL — XOS Exokernel [XSPEC-0004]
-; Arquitectura: x86-64, cargado por XBOOT propio (NO GRUB/Multiboot2)
-; Cadena de arranque: XBOOT (0x7C00) -> XKERNEL (0x9000, 16-bit)
-;                   16-bit -> 32-bit -> 64-bit -> EXIT -> XSH
+; XKERNEL — Wayward: nucleo del exokernel XASMOS [XSPEC-0004]
+; Cadena de arranque: Exord (0x7C00) -> XKERNEL (0x9000, 16-bit)
 ;                     -> 32-bit -> 64-bit -> EXIT -> XSH
+;
+; Mejoras sobre la version anterior (misma API publica, sin romper nada
+; que ya dependa de este kernel):
+;   1. Linea A20 habilitada (metodo rapido, puerto 0x92) antes de proteger.
+;      Sin esto, cualquier acceso a memoria >1MB se envuelve en hardware
+;      real. No fallaba hasta ahora porque todo el diseño vive bajo 1MB,
+;      pero es una bomba de tiempo para cuando crezca (mas kernel, mas EXFS).
+;   2. Verificacion de soporte CPUID y Long Mode antes de saltar a 64-bit.
+;      Si el CPU no soporta long mode, se imprime un error claro y se
+;      detiene limpiamente en vez de un triple fault silencioso.
+;   3. Cursor de video rastreado como fila/columna directas: se eliminaron
+;      las dos instrucciones DIV que se ejecutaban en cada newline/CR.
+;
+; Simbolos publicos sin cambios (exfs.asm / exit.asm / xsh.asm dependen
+; de estos nombres exactos):
+;   cursor_pos, readline_buf, exfs_cur_dir_name, exfs_cur_dir_lba,
+;   exfs_io_buf, xk_init_video, xk_init_keyboard, xk_scroll, xk_putchar,
+;   xk_print, xk_println, xk_readline, xk_getkey, xk_strcmp, xk_strlen,
+;   xk_strncpy
 ; =============================================================================
 [BITS 16]
 org 0x9000
@@ -19,11 +36,23 @@ kernel_16_entry:
     mov si, msg_16
     call print16
 
+    call enable_a20
+    call check_long_mode_support
+    jc   .no_long_mode
+
     lgdt [gdt32_ptr]
     mov eax, cr0
     or  eax, 1
     mov cr0, eax
     jmp 0x08:kernel_32_entry
+
+.no_long_mode:
+    mov si, msg_no_lm
+    call print16
+    cli
+.halt16:
+    hlt
+    jmp .halt16
 
 print16:
     mov ah, 0x0E
@@ -37,10 +66,68 @@ print16:
 .ret:
     ret
 
-msg_16 db 'XKERNEL 16-bit OK', 13, 10, 0
+; -----------------------------------------------------------------------
+; enable_a20 — habilita la linea A20 via el metodo rapido (puerto 0x92).
+; Soportado por practicamente todo el hardware x86 desde los 90s en
+; adelante, y por QEMU/VirtualBox/VMware. Si algun dia se necesita
+; soporte para hardware anterior a eso, el metodo del controlador de
+; teclado 8042 es el fallback clasico, pero se omite aqui a proposito
+; para no añadir complejidad que ningun hardware real actual necesita.
+; -----------------------------------------------------------------------
+enable_a20:
+    push ax
+    in   al, 0x92
+    test al, 2
+    jnz  .done          ; ya estaba habilitada
+    or   al, 2
+    and  al, 0xFE       ; no tocar el bit de reset rapido (bit 0)
+    out  0x92, al
+.done:
+    pop  ax
+    ret
 
 ; -----------------------------------------------------------------------
-; GDT de 32 bits (unica — nombre unico en todo el proyecto)
+; check_long_mode_support — CF=0 si el CPU soporta 64-bit, CF=1 si no.
+; Paso 1: verificar que CPUID existe (toggle del bit ID en EFLAGS).
+; Paso 2: verificar que la hoja extendida 0x80000001 esta disponible.
+; Paso 3: verificar el bit 29 (LM) de EDX en esa hoja.
+; -----------------------------------------------------------------------
+check_long_mode_support:
+    pushfd
+    pop  eax
+    mov  ecx, eax
+    xor  eax, 1 << 21        ; intentar togglear el bit ID (21)
+    push eax
+    popfd
+    pushfd
+    pop  eax
+    push ecx
+    popfd
+    xor  eax, ecx
+    jz   .no_cpuid           ; si no cambio, no hay CPUID
+
+    mov  eax, 0x80000000
+    cpuid
+    cmp  eax, 0x80000001
+    jb   .no_lm              ; sin hoja extendida, sin long mode
+
+    mov  eax, 0x80000001
+    cpuid
+    test edx, 1 << 29
+    jz   .no_lm
+
+    clc
+    ret
+.no_cpuid:
+.no_lm:
+    stc
+    ret
+
+msg_16      db 'XKERNEL 16-bit OK', 13, 10, 0
+msg_no_lm   db 'ERROR: CPU sin soporte Long Mode (64-bit). Deteniendo.', 13, 10, 0
+
+; -----------------------------------------------------------------------
+; GDT de 32 bits (unica en todo el proyecto)
 ; -----------------------------------------------------------------------
 align 8
 gdt32_start:
@@ -53,7 +140,7 @@ gdt32_ptr:
     dd gdt32_start
 
 ; -----------------------------------------------------------------------
-; GDT de 64 bits (unica — nombre unico en todo el proyecto)
+; GDT de 64 bits (unica en todo el proyecto)
 ; -----------------------------------------------------------------------
 align 8
 gdt64_start:
@@ -107,7 +194,7 @@ kernel_32_entry:
     mov eax, 0x1000
     mov cr3, eax
 
-    ; Activar Long Mode en EFER
+    ; Activar Long Mode en EFER (ya verificamos que el CPU lo soporta)
     mov ecx, 0xC0000080
     rdmsr
     or  eax, (1 << 8)
@@ -134,11 +221,9 @@ kernel_64_entry:
     mov gs, ax
     mov ss, ax
     mov rsp, stack_top_64
+    cld                       ; asegurar DF=0 para todas las rep string ops
 
     call xk_init_video
-
-    ; Unico punto de entrada al init del sistema.
-    ; exit_main_executor esta definido en src/init/exit.asm
     call exit_main_executor
 
 .halt:
@@ -148,8 +233,6 @@ kernel_64_entry:
 
 ; =============================================================================
 ; VARIABLES GLOBALES DEL KERNEL
-; Declaradas UNA sola vez aqui. exit.asm / xsh.asm / exfs.asm las referencian
-; con `extern` implicito (flat binary: solo necesitan el simbolo global).
 ; =============================================================================
 global cursor_pos
 global readline_buf
@@ -157,16 +240,15 @@ global exfs_cur_dir_name
 global exfs_cur_dir_lba
 global exfs_io_buf
 
-cursor_pos:         dw 0             ; posicion en celdas VGA (0..1999)
-readline_buf:       times 256 db 0   ; buffer de linea leida por teclado
+cursor_pos:         dw 0             ; espejo de compatibilidad (row*80+col)
+cursor_row:         db 0
+cursor_col:         db 0
+readline_buf:       times 256 db 0
 exfs_cur_dir_name:  db '|', 0
                      times 126 db 0
 exfs_cur_dir_lba:   dq 0
-exfs_io_buf:        times 512 db 0   ; buffer de I/O de 1 sector para EXFS
+exfs_io_buf:        times 512 db 0
 
-; =============================================================================
-; VIDEO — VGA texto 80x25 en 0xB8000
-; =============================================================================
 VGA_BASE equ 0xB8000
 VGA_COLS equ 80
 VGA_ROWS equ 25
@@ -181,13 +263,14 @@ xk_init_video:
     mov  rcx, VGA_COLS * VGA_ROWS
     mov  ax,  0x0720
     rep  stosw
+    mov  byte [cursor_row], 0
+    mov  byte [cursor_col], 0
     mov  word [cursor_pos], 0
     pop  rax
     pop  rcx
     pop  rdi
     ret
 
-; xk_init_keyboard — vacia el buffer del controlador PS/2 por si hay basura
 global xk_init_keyboard
 xk_init_keyboard:
     push rax
@@ -216,7 +299,10 @@ xk_scroll:
     mov  rcx, VGA_COLS
     mov  ax,  0x0720
     rep  stosw
-    mov  word [cursor_pos], VGA_COLS * (VGA_ROWS - 1)
+    mov  byte [cursor_row], VGA_ROWS - 1
+    mov  ax,  VGA_COLS
+    mul  byte [cursor_row]   ; AX = row*80, sin division
+    mov  word [cursor_pos], ax
     pop  rcx
     pop  rdi
     pop  rsi
@@ -224,11 +310,13 @@ xk_scroll:
 
 ; xk_putchar — AL = caracter, BL = atributo de color
 ; Maneja: newline (10), retorno de carro (13), backspace (8), scroll automatico
+; Rastrea fila/columna directamente: sin DIV en ninguna ruta.
 global xk_putchar
 xk_putchar:
     push rax
     push rbx
     push rcx
+    push rdx
     push rdi
 
     cmp al, 10
@@ -238,55 +326,65 @@ xk_putchar:
     cmp al, 8
     je  .backspace
 
-    movzx rcx, word [cursor_pos]
-    cmp   rcx, VGA_COLS * VGA_ROWS
-    jl    .write
-    call  xk_scroll
-    movzx rcx, word [cursor_pos]
+    ; ¿pantalla llena? scroll antes de escribir
+    cmp  byte [cursor_row], VGA_ROWS
+    jl   .write
+    call xk_scroll
 .write:
-    shl  rcx, 1
-    add  rcx, VGA_BASE
-    mov  ah, bl
-    mov  word [rcx], ax
-    inc  word [cursor_pos]
-    jmp  .done
+    movzx rcx, byte [cursor_row]
+    imul  rcx, VGA_COLS
+    movzx rdx, byte [cursor_col]
+    add   rcx, rdx
+    shl   rcx, 1
+    add   rcx, VGA_BASE
+    mov   ah, bl
+    mov   word [rcx], ax
+
+    inc   byte [cursor_col]
+    cmp   byte [cursor_col], VGA_COLS
+    jl    .sync
+    mov   byte [cursor_col], 0
+    inc   byte [cursor_row]
+    jmp   .sync
 
 .newline:
-    movzx rax, word [cursor_pos]
-    xor   rdx, rdx
-    mov   rcx, VGA_COLS
-    div   rcx
-    inc   rax
-    imul  rax, VGA_COLS
-    cmp   rax, VGA_COLS * VGA_ROWS
-    jl    .setpos
-    call  xk_scroll
-    jmp   .done
-.setpos:
-    mov   word [cursor_pos], ax
-    jmp   .done
+    mov  byte [cursor_col], 0
+    inc  byte [cursor_row]
+    jmp  .sync
 
 .cr:
-    movzx rax, word [cursor_pos]
-    xor   rdx, rdx
-    mov   rcx, VGA_COLS
-    div   rcx
-    imul  rax, VGA_COLS
-    mov   word [cursor_pos], ax
-    jmp   .done
+    mov  byte [cursor_col], 0
+    jmp  .sync
 
 .backspace:
-    cmp  word [cursor_pos], 0
+    cmp  byte [cursor_col], 0
     je   .done
-    dec  word [cursor_pos]
-    movzx rcx, word [cursor_pos]
-    shl  rcx, 1
-    add  rcx, VGA_BASE
-    mov  word [rcx], 0x0720
+    dec  byte [cursor_col]
+    movzx rcx, byte [cursor_row]
+    imul  rcx, VGA_COLS
+    movzx rax, byte [cursor_col]
+    add   rcx, rax
+    shl   rcx, 1
+    add   rcx, VGA_BASE
+    mov   word [rcx], 0x0720
+    jmp   .done
+
+.sync:
+    cmp  byte [cursor_row], VGA_ROWS
+    jl   .mirror
+    call xk_scroll
     jmp  .done
+.mirror:
+    ; cursor_pos como espejo de compatibilidad (row*80+col), sin DIV
+    movzx rax, byte [cursor_row]
+    imul  rax, VGA_COLS
+    movzx rcx, byte [cursor_col]
+    add   rax, rcx
+    mov   word [cursor_pos], ax
 
 .done:
     pop rdi
+    pop rdx
     pop rcx
     pop rbx
     pop rax
@@ -323,7 +421,7 @@ xk_println:
 
 ; xk_readline — lee linea real del teclado PS/2 (scancode set 1)
 ; Entrada: RDI = buffer destino, RCX = max caracteres
-; Salida:  RAX = longitud leida; buffer null-terminated
+; Salida:  RAX = longitud leida; buffer null-terminado
 scancode_map:
     db 0,0,'1','2','3','4','5','6','7','8','9','0','-','=',8,9
     db 'q','w','e','r','t','y','u','i','o','p','[',']',13,0
@@ -403,11 +501,32 @@ xk_readline:
     pop  rbx
     ret
 
+; xk_getkey — lectura cruda de una tecla (para editores/apps interactivas)
+; Salida: AL = ascii traducido (0 si no mapeado), AH = scancode crudo
+global xk_getkey
+xk_getkey:
+    push rbx
+    push rdx
+.rd:
+    in   al, 0x64
+    test al, 1
+    jz   .rd
+    in   al, 0x60
+    cmp  al, 0x80
+    jge  .rd
+    mov  dl, al
+    lea  rbx, [rel scancode_map]
+    movzx rax, al
+    mov  al, [rbx + rax]
+    mov  ah, dl
+    pop  rdx
+    pop  rbx
+    ret
+
 ; =============================================================================
 ; UTILIDADES DE STRING (una sola definicion de cada una)
 ; =============================================================================
 
-; xk_strcmp — compara [RSI] con [RDI]. RAX=0 si iguales, RAX=1 si no.
 global xk_strcmp
 xk_strcmp:
     push rsi
@@ -436,7 +555,6 @@ xk_strcmp:
     pop  rsi
     ret
 
-; xk_strlen — RSI = string, retorna longitud en RAX
 global xk_strlen
 xk_strlen:
     push rsi
@@ -451,7 +569,6 @@ xk_strlen:
     pop  rsi
     ret
 
-; xk_strncpy — copia max RCX chars de RSI a RDI, null-terminado
 global xk_strncpy
 xk_strncpy:
     test rcx, rcx
@@ -473,4 +590,4 @@ xk_strncpy:
 ; =============================================================================
 %include "src/drivers/exfs.asm"
 %include "src/init/exit.asm"
-%include "src/apps/xsh.asm"
+%include "src/apps/xsh/xsh.asm"
